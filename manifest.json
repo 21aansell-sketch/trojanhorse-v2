@@ -8,6 +8,7 @@
     }
   ],
   "main": "index.tsx",
+  "hash": "PUT_THE_SHA256_HASH_OF_INDEX_TSX_HERE",
   "vendetta": {
     "icon": "ic_edit_24px"
   }
