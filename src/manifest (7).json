@@ -1,0 +1,15 @@
+{
+  "name": "Local Edit",
+  "description": "Edit messages locally.",
+  "authors": [
+    {
+      "name": "21aansell-sketch",
+      "id": "1369338985800925296"
+    }
+  ],
+  "main": "index.tsx",
+  "hash": "9bf4c5a55559afbe0761f984bc2e58a44a51dd65141a1caf37cddd897987e6e3",
+  "vendetta": {
+    "icon": "ic_edit_24px"
+  }
+}
