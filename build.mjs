@@ -3,6 +3,7 @@ import { extname } from "path";
 import { createHash } from "crypto";
 
 import { rollup } from "rollup";
+import esbuild from "rollup-plugin-esbuild";
 import commonjs from "@rollup/plugin-commonjs";
 import nodeResolve from "@rollup/plugin-node-resolve";
 import swc from "@swc/core";
@@ -18,15 +19,11 @@ const extensions = [
 ];
 
 const plugins = [
-    nodeResolve({
-        extensions,
-        preferBuiltins: false,
-    }),
-
+    nodeResolve(),
     commonjs(),
 
     {
-        name: "swc-typescript",
+        name: "swc",
 
         async transform(code, id) {
             const ext = extname(id);
@@ -35,98 +32,120 @@ const plugins = [
                 return null;
             }
 
-            const isTypeScript =
-                ext === ".ts" ||
-                ext === ".tsx";
+            const ts = ext.includes("ts");
+            const tsx = ts ? ext.endsWith("x") : undefined;
+            const jsx = !ts ? ext.endsWith("x") : undefined;
 
             const result = await swc.transform(code, {
                 filename: id,
 
                 jsc: {
+                    externalHelpers: true,
+
                     parser: {
-                        syntax: isTypeScript
-                            ? "typescript"
-                            : "ecmascript",
-
-                        tsx: ext === ".tsx",
-                        jsx: ext === ".jsx",
+                        syntax: ts ? "typescript" : "ecmascript",
+                        tsx,
+                        jsx,
                     },
+                },
 
-                    target: "es2020",
+                env: {
+                    targets: "defaults",
 
-                    transform: {
-                        react: {
-                            runtime: "automatic",
-                        },
-                    },
+                    include: [
+                        "transform-classes",
+                        "transform-arrow-functions",
+                    ],
                 },
             });
 
-            return {
-                code: result.code,
-                map: result.map,
-            };
+            return result.code;
         },
     },
+
+    esbuild({
+        minify: true,
+    }),
 ];
 
-for (const plug of await readdir("./plugins")) {
-    const pluginDir = `./plugins/${plug}`;
-    const manifestPath = `${pluginDir}/manifest.json`;
+const pluginsDir = "./plugins";
+const distDir = "./dist";
+
+await mkdir(distDir, {
+    recursive: true,
+});
+
+for (const plug of await readdir(pluginsDir)) {
+    const sourceManifestPath =
+        `${pluginsDir}/${plug}/manifest.json`;
 
     const manifest = JSON.parse(
-        await readFile(manifestPath, "utf8"),
+        await readFile(sourceManifestPath, "utf8"),
     );
 
-    const outDir = `./dist/${plug}`;
+    const outDir = `${distDir}/${plug}`;
     const outPath = `${outDir}/index.js`;
 
     await mkdir(outDir, {
         recursive: true,
     });
 
-    const bundle = await rollup({
-        input: `${pluginDir}/${manifest.main}`,
+    try {
+        const bundle = await rollup({
+            input: `${pluginsDir}/${plug}/${manifest.main}`,
 
-        external: (id) =>
-            id.startsWith("@vendetta/") ||
-            id === "react" ||
-            id === "react-native",
+            onwarn() {},
 
-        plugins,
-    });
+            plugins,
+        });
 
-    await bundle.write({
-        file: outPath,
+        await bundle.write({
+            file: outPath,
 
-        format: "iife",
+            globals(id) {
+                if (id.startsWith("@vendetta/")) {
+                    return `vendetta.${id
+                        .substring("@vendetta/".length)
+                        .replace(/\//g, ".")}`;
+                }
 
-        name: "plugin",
+                const globals = {
+                    react: "window.React",
+                    "react-native": "window.ReactNative",
+                };
 
-        globals: {
-            react: "React",
-            "react-native": "ReactNative",
-        },
+                return globals[id] || undefined;
+            },
 
-        sourcemap: false,
-    });
+            format: "iife",
+            compact: true,
+            exports: "named",
+        });
 
-    await bundle.close();
+        await bundle.close();
 
-    const javascript = await readFile(outPath);
+        const built = await readFile(outPath);
 
-    manifest.hash = createHash("sha256")
-        .update(javascript)
-        .digest("hex");
+        manifest.hash = createHash("sha256")
+            .update(built)
+            .digest("hex");
 
-    manifest.main = "index.js";
+        manifest.main = "index.js";
 
-    await writeFile(
-        `${outDir}/manifest.json`,
-        JSON.stringify(manifest, null, 2),
-    );
+        await writeFile(
+            `${outDir}/manifest.json`,
+            JSON.stringify(manifest, null, 2),
+        );
 
-    console.log(
-        `Built ${manifest.name}`,
-    );
+        console.log(
+            `Successfully built ${manifest.name}!`,
+        );
+    } catch (error) {
+        console.error(
+            `Failed to build ${manifest.name}:`,
+            error,
+        );
+
+        process.exit(1);
+    }
 }
