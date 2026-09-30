@@ -7,7 +7,15 @@ import commonjs from "@rollup/plugin-commonjs";
 import nodeResolve from "@rollup/plugin-node-resolve";
 import swc from "@swc/core";
 
-const extensions = [".js", ".jsx", ".mjs", ".ts", ".tsx", ".cts", ".mts"];
+const extensions = [
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".ts",
+    ".tsx",
+    ".cts",
+    ".mts",
+];
 
 const plugins = [
     nodeResolve({
@@ -27,19 +35,30 @@ const plugins = [
                 return null;
             }
 
-            const isTypeScript = ext === ".ts" || ext === ".tsx";
+            const isTypeScript =
+                ext === ".ts" ||
+                ext === ".tsx";
 
             const result = await swc.transform(code, {
                 filename: id,
 
                 jsc: {
                     parser: {
-                        syntax: isTypeScript ? "typescript" : "ecmascript",
+                        syntax: isTypeScript
+                            ? "typescript"
+                            : "ecmascript",
+
                         tsx: ext === ".tsx",
                         jsx: ext === ".jsx",
                     },
 
                     target: "es2020",
+
+                    transform: {
+                        react: {
+                            runtime: "automatic",
+                        },
+                    },
                 },
             });
 
@@ -62,50 +81,52 @@ for (const plug of await readdir("./plugins")) {
     const outDir = `./dist/${plug}`;
     const outPath = `${outDir}/index.js`;
 
-    try {
-        await mkdir(outDir, { recursive: true });
+    await mkdir(outDir, {
+        recursive: true,
+    });
 
-        const bundle = await rollup({
-            input: `${pluginDir}/${manifest.main}`,
+    const bundle = await rollup({
+        input: `${pluginDir}/${manifest.main}`,
 
-            external: (id) =>
-                id.startsWith("@vendetta/") ||
-                id === "react" ||
-                id === "react-native",
+        external: (id) =>
+            id.startsWith("@vendetta/") ||
+            id === "react" ||
+            id === "react-native",
 
-            onwarn: () => {},
+        plugins,
+    });
 
-            plugins,
-        });
+    await bundle.write({
+        file: outPath,
 
-        await bundle.write({
-            file: outPath,
+        format: "iife",
 
-            format: "es",
+        name: "plugin",
 
-            exports: "named",
+        globals: {
+            react: "React",
+            "react-native": "ReactNative",
+        },
 
-            sourcemap: false,
-        });
+        sourcemap: false,
+    });
 
-        await bundle.close();
+    await bundle.close();
 
-        const javascript = await readFile(outPath);
+    const javascript = await readFile(outPath);
 
-        manifest.hash = createHash("sha256")
-            .update(javascript)
-            .digest("hex");
+    manifest.hash = createHash("sha256")
+        .update(javascript)
+        .digest("hex");
 
-        manifest.main = "index.js";
+    manifest.main = "index.js";
 
-        await writeFile(
-            `${outDir}/manifest.json`,
-            JSON.stringify(manifest, null, 2),
-        );
+    await writeFile(
+        `${outDir}/manifest.json`,
+        JSON.stringify(manifest, null, 2),
+    );
 
-        console.log(`Successfully built ${manifest.name}!`);
-    } catch (error) {
-        console.error(`Failed to build plugin ${plug}:`, error);
-        process.exit(1);
-    }
+    console.log(
+        `Built ${manifest.name}`,
+    );
 }
