@@ -1,104 +1,113 @@
 import { findByProps, findByStoreName } from "@vendetta/metro";
-import { FluxDispatcher, React } from "@vendetta/metro/common";
-import { after, before } from "@vendetta/patcher";
+import { FluxDispatcher, i18n } from "@vendetta/metro/common";
+import { before, after } from "@vendetta/patcher";
 import { getAssetIDByName } from "@vendetta/ui/assets";
 import { Forms } from "@vendetta/ui/components";
 import { findInReactTree } from "@vendetta/utils";
+import React from "react";
 
 type Message = any;
-type Unpatch = () => void;
 
 const edits = new Map<string, Message>();
+
 let isEditing = false;
-let loaded = false;
-const patches: Unpatch[] = [];
+let patches: (() => void)[] = [];
 
 function getModules() {
-    try {
-        const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
-        const Messages = findByProps(
+    return {
+        LazyActionSheet: findByProps("openLazy", "hideActionSheet"),
+        Messages: findByProps(
+            "sendMessage",
             "startEditMessage",
             "editMessage",
             "endEditMessage",
+        ),
+        MessageStore: findByStoreName("MessageStore"),
+        UserStore: findByStoreName("UserStore"),
+        ActionSheetRow:
+            findByProps("ActionSheetRow")?.ActionSheetRow ??
+            Forms?.FormRow,
+    };
+}
+
+function getMessage(
+    MessageStore: any,
+    channelId: string,
+    messageId: string,
+    fallback?: Message,
+) {
+    try {
+        return (
+            MessageStore?.getMessage?.(channelId, messageId) ??
+            fallback
         );
-        const MessageStore = findByStoreName("MessageStore");
-        const UserStore = findByStoreName("UserStore");
-        const ActionSheetRow =
-            findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms?.FormRow;
-
-        return { LazyActionSheet, Messages, MessageStore, UserStore, ActionSheetRow };
-    } catch (error) {
-        console.error("[TrojanHorse] Failed to resolve Discord modules", error);
-        return null;
-    }
-}
-
-function safePatch(patch: (() => void) | undefined | null) {
-    if (typeof patch === "function") patches.push(patch);
-}
-
-function safeClone<T>(value: T): T {
-    try {
-        return JSON.parse(JSON.stringify(value));
-    } catch {
-        return value;
-    }
-}
-
-function getMessage(MessageStore: any, channelId: string, messageId: string, fallback?: Message) {
-    try {
-        return MessageStore?.getMessage?.(channelId, messageId) ?? fallback;
     } catch {
         return fallback;
     }
 }
 
-function getComponentName(type: any) {
-    return (
+function isActionSheetRow(
+    node: any,
+    ActionSheetRow: any,
+): boolean {
+    if (!node) return false;
+
+    const type = node?.type;
+
+    if (type === ActionSheetRow) return true;
+
+    const name =
         type?.displayName ??
         type?.name ??
         type?.render?.displayName ??
-        type?.render?.name
-    );
+        type?.render?.name;
+
+    return name === "ActionSheetRow" || name === "FormRow";
 }
 
-function isActionSheetRow(node: any, ActionSheetRow: any) {
-    if (!node) return false;
-    const type = node.type;
-    return (
-        type === ActionSheetRow ||
-        getComponentName(type) === "ActionSheetRow" ||
-        getComponentName(type) === "FormRow"
-    );
-}
-
-function findActionSheetButtons(tree: any, ActionSheetRow: any) {
+function findActionSheetButtons(
+    tree: any,
+    ActionSheetRow: any,
+): any[] | undefined {
     try {
-        const result = findInReactTree(tree, (node: any) => {
-            if (!Array.isArray(node)) return false;
-            return node.some(
-                (child: any) => child?.props && isActionSheetRow(child, ActionSheetRow),
-            );
-        });
+        const result = findInReactTree(
+            tree,
+            (node: any) => {
+                if (!Array.isArray(node)) return false;
+
+                return node.some(
+                    (child: any) =>
+                        child?.props &&
+                        isActionSheetRow(child, ActionSheetRow),
+                );
+            },
+        );
+
         return Array.isArray(result) ? result : undefined;
-    } catch (error) {
-        console.error("[TrojanHorse] Failed to inspect action sheet", error);
+    } catch {
         return undefined;
     }
 }
 
-function resetEditState() {
-    isEditing = false;
+function cloneMessage(message: Message): Message {
+    try {
+        return JSON.parse(JSON.stringify(message));
+    } catch {
+        return { ...message };
+    }
 }
 
 export default {
     onLoad() {
-        if (loaded) return;
-        loaded = true;
+        // Resolve Discord/Vendetta modules only when the plugin is enabled.
+        // If a module is unavailable on this client version, fail closed
+        // instead of throwing and causing the plugin to be disabled.
+        let modules: ReturnType<typeof getModules>;
 
-        const modules = getModules();
-        if (!modules) {
-            loaded = false;
+        try {
+            modules = getModules();
+        } catch (error) {
+            console.error("[LocalEdit] Failed to resolve modules:", error);
             return;
         }
 
@@ -110,175 +119,297 @@ export default {
             ActionSheetRow,
         } = modules;
 
-        // A plugin should never stay enabled if its required host APIs are absent.
-        if (!LazyActionSheet?.openLazy || !Messages?.startEditMessage || !Messages?.editMessage) {
-            console.warn("[TrojanHorse] Required Discord APIs are unavailable; plugin not loaded");
-            loaded = false;
+        if (!LazyActionSheet?.openLazy) {
+            console.error("[LocalEdit] Message action sheet API unavailable.");
             return;
         }
 
-        safePatch(
-            before("openLazy", LazyActionSheet, ([component, key, props]: any[]) => {
-                if (key !== "MessageLongPressActionSheet") return;
+        if (!Messages?.editMessage || !Messages?.startEditMessage) {
+            console.error("[LocalEdit] Message edit API unavailable.");
+            return;
+        }
 
-                const originalMessage = props?.message;
-                if (!originalMessage?.id || !originalMessage?.channel_id) return;
+        if (!ActionSheetRow) {
+            console.error("[LocalEdit] ActionSheetRow unavailable.");
+            return;
+        }
 
-                const promise = component?.then;
-                if (typeof promise !== "function") return;
+        try {
+            patches.push(
+                before(
+                    "openLazy",
+                    LazyActionSheet,
+                    ([component, key, msg]) => {
+                        if (key !== "MessageLongPressActionSheet") {
+                            return;
+                        }
 
-                component.then((instance: any) => {
-                    if (!instance?.default) return;
+                        const message = msg?.message;
 
-                    let actionSheetUnpatch: Unpatch | undefined;
+                        if (!message?.id || !message?.channel_id) {
+                            return;
+                        }
 
-                    try {
-                        actionSheetUnpatch = after(
-                            "default",
-                            instance,
-                            (_args: any[], result: any) => {
-                                setTimeout(() => {
-                                    try {
-                                        const buttons = findActionSheetButtons(result, ActionSheetRow);
-                                        if (!buttons || !ActionSheetRow) return;
+                        // openLazy normally receives a promise for the sheet.
+                        Promise.resolve(component)
+                            .then((instance: any) => {
+                                if (!instance?.default) return;
 
-                                        const currentMessage = getMessage(
-                                            MessageStore,
-                                            originalMessage.channel_id,
-                                            originalMessage.id,
-                                            originalMessage,
-                                        );
-                                        if (!currentMessage) return;
+                                let sheetPatch: (() => void) | undefined;
 
-                                        const currentUser = UserStore?.getCurrentUser?.();
-                                        if (currentUser?.id && currentMessage.author?.id !== currentUser.id) {
-                                            return;
-                                        }
+                                try {
+                                    sheetPatch = after(
+                                        "default",
+                                        instance,
+                                        (_args: any, res: any) => {
+                                            setTimeout(() => {
+                                                try {
+                                                    const buttons =
+                                                        findActionSheetButtons(
+                                                            res,
+                                                            ActionSheetRow,
+                                                        );
 
-                                        if (
-                                            buttons.some(
-                                                (button: any) =>
-                                                    button?.props?.label === "Edit Locally",
-                                            )
-                                        ) {
-                                            return;
-                                        }
+                                                    if (!buttons) return;
 
-                                        const handleEdit = () => {
-                                            const snapshot = safeClone(currentMessage);
-                                            edits.set(currentMessage.id, snapshot);
-                                            isEditing = true;
+                                                    const currentMessage =
+                                                        getMessage(
+                                                            MessageStore,
+                                                            message.channel_id,
+                                                            message.id,
+                                                            message,
+                                                        );
 
-                                            try {
-                                                LazyActionSheet.hideActionSheet?.();
-                                                Messages.startEditMessage(
-                                                    currentMessage.channel_id,
-                                                    currentMessage.id,
-                                                    currentMessage.content ?? "",
-                                                );
-                                            } catch (error) {
-                                                console.error("[TrojanHorse] Failed to start local edit", error);
-                                                edits.delete(currentMessage.id);
-                                                resetEditState();
-                                            }
-                                        };
+                                                    if (!currentMessage) return;
 
-                                        const iconId = (() => {
-                                            try {
-                                                return getAssetIDByName("ic_edit_24px");
-                                            } catch {
-                                                return undefined;
-                                            }
-                                        })();
+                                                    const currentUser =
+                                                        UserStore?.getCurrentUser?.();
 
-                                        const icon = iconId != null && (ActionSheetRow as any).Icon
-                                            ? React.createElement((ActionSheetRow as any).Icon, { source: iconId })
-                                            : undefined;
+                                                    // Preserve the original behavior:
+                                                    // do not add the local-edit action
+                                                    // to messages belonging to the
+                                                    // current user.
+                                                    if (
+                                                        currentUser?.id &&
+                                                        currentMessage.author?.id ===
+                                                            currentUser.id
+                                                    ) {
+                                                        return;
+                                                    }
 
-                                        const button = React.createElement(ActionSheetRow, {
-                                            label: "Edit Locally",
-                                            ...(icon ? { icon } : {}),
-                                            onPress: handleEdit,
-                                        });
+                                                    if (
+                                                        buttons.some(
+                                                            (button: any) =>
+                                                                button?.props
+                                                                    ?.label ===
+                                                                "Edit Locally",
+                                                        )
+                                                    ) {
+                                                        return;
+                                                    }
 
-                                        // Insert before the final destructive/secondary actions when possible.
-                                        const position = Math.max(buttons.length - 1, 0);
-                                        buttons.splice(position, 0, button);
-                                    } catch (error) {
-                                        console.error("[TrojanHorse] Failed to add Edit Locally", error);
-                                    } finally {
-                                        try {
-                                            actionSheetUnpatch?.();
-                                        } catch {}
-                                        actionSheetUnpatch = undefined;
-                                    }
-                                }, 0);
-                            },
-                        );
-                    } catch (error) {
-                        console.error("[TrojanHorse] Failed to patch action sheet component", error);
-                    }
-                }).catch((error: any) => {
-                    console.error("[TrojanHorse] Failed to load action sheet component", error);
-                });
-            }),
-        );
+                                                    const markUnreadIndex =
+                                                        buttons.findIndex(
+                                                            (button: any) =>
+                                                                button?.props
+                                                                    ?.message ===
+                                                                i18n?.Messages
+                                                                    ?.MARK_UNREAD,
+                                                        );
 
-        safePatch(
-            before("editMessage", Messages, (args: any[]) => {
-                if (!isEditing) return;
+                                                    const position =
+                                                        markUnreadIndex >= 0
+                                                            ? markUnreadIndex
+                                                            : Math.max(
+                                                                  buttons.length -
+                                                                      1,
+                                                                  0,
+                                                              );
 
-                const channelId = args?.[0];
-                const messageId = args?.[1];
-                const payload = args?.[2];
-                const snapshot = messageId ? edits.get(messageId) : undefined;
+                                                    const handleEdit = () => {
+                                                        try {
+                                                            isEditing = true;
 
-                if (!snapshot) {
-                    resetEditState();
-                    return;
-                }
+                                                            if (
+                                                                !edits.has(
+                                                                    currentMessage.id,
+                                                                )
+                                                            ) {
+                                                                edits.set(
+                                                                    currentMessage.id,
+                                                                    cloneMessage(
+                                                                        currentMessage,
+                                                                    ),
+                                                                );
+                                                            }
 
-                const newContent =
-                    typeof payload === "string" ? payload : payload?.content ?? "";
+                                                            LazyActionSheet?.hideActionSheet?.();
 
-                try {
-                    FluxDispatcher.dispatch({
-                        type: "MESSAGE_UPDATE",
-                        message: {
-                            ...snapshot,
-                            channel_id: channelId ?? snapshot.channel_id,
-                            id: messageId ?? snapshot.id,
-                            content: newContent,
-                            edited_timestamp: null,
-                        },
-                        otherPluginBypass: true,
-                    });
-                    return false;
-                } catch (error) {
-                    console.error("[TrojanHorse] Local edit dispatch failed", error);
-                    resetEditState();
-                }
-            }),
-        );
+                                                            Messages.startEditMessage(
+                                                                currentMessage.channel_id,
+                                                                currentMessage.id,
+                                                                currentMessage.content ??
+                                                                    "",
+                                                            );
+                                                        } catch (error) {
+                                                            isEditing = false;
+                                                            console.error(
+                                                                "[LocalEdit] Failed to start local edit:",
+                                                                error,
+                                                            );
+                                                        }
+                                                    };
 
-        if (Messages.endEditMessage) {
-            safePatch(
-                after("endEditMessage", Messages, () => {
-                    resetEditState();
-                }),
+                                                    const Icon = (
+                                                        ActionSheetRow as any
+                                                    )?.Icon;
+
+                                                    const icon = Icon
+                                                        ? React.createElement(
+                                                              Icon,
+                                                              {
+                                                                  source: getAssetIDByName(
+                                                                      "ic_edit_24px",
+                                                                  ),
+                                                              },
+                                                          )
+                                                        : undefined;
+
+                                                    const button =
+                                                        React.createElement(
+                                                            ActionSheetRow,
+                                                            {
+                                                                label: "Edit Locally",
+                                                                icon,
+                                                                onPress:
+                                                                    handleEdit,
+                                                            },
+                                                        );
+
+                                                    buttons.splice(
+                                                        position,
+                                                        0,
+                                                        button,
+                                                    );
+                                                } catch (error) {
+                                                    console.error(
+                                                        "[LocalEdit] Failed to add Edit Locally:",
+                                                        error,
+                                                    );
+                                                } finally {
+                                                    try {
+                                                        sheetPatch?.();
+                                                    } catch {
+                                                        // Already unpatched.
+                                                    }
+                                                }
+                                            }, 0);
+                                        },
+                                    );
+                                } catch (error) {
+                                    console.error(
+                                        "[LocalEdit] Failed to patch action sheet:",
+                                        error,
+                                    );
+                                }
+                            })
+                            .catch((error: any) => {
+                                console.error(
+                                    "[LocalEdit] Failed to load action sheet:",
+                                    error,
+                                );
+                            });
+                    },
+                ),
             );
+        } catch (error) {
+            console.error(
+                "[LocalEdit] Failed to patch openLazy:",
+                error,
+            );
+        }
+
+        try {
+            patches.push(
+                before(
+                    "editMessage",
+                    Messages,
+                    (args: any[]) => {
+                        if (!isEditing) return;
+
+                        const [, messageId, message] = args;
+                        const baseMessage = edits.get(messageId);
+
+                        if (!baseMessage) {
+                            isEditing = false;
+                            return;
+                        }
+
+                        try {
+                            const newContent =
+                                typeof message === "string"
+                                    ? message
+                                    : message?.content ?? "";
+
+                            FluxDispatcher.dispatch({
+                                type: "MESSAGE_UPDATE",
+                                message: {
+                                    ...baseMessage,
+                                    content: newContent,
+                                    edited_timestamp: null,
+                                },
+                                otherPluginBypass: true,
+                            });
+
+                            return false;
+                        } catch (error) {
+                            isEditing = false;
+                            console.error(
+                                "[LocalEdit] Failed to apply local edit:",
+                                error,
+                            );
+                        }
+                    },
+                ),
+            );
+        } catch (error) {
+            console.error(
+                "[LocalEdit] Failed to patch editMessage:",
+                error,
+            );
+        }
+
+        if (Messages?.endEditMessage) {
+            try {
+                patches.push(
+                    after(
+                        "endEditMessage",
+                        Messages,
+                        () => {
+                            isEditing = false;
+                        },
+                    ),
+                );
+            } catch (error) {
+                console.error(
+                    "[LocalEdit] Failed to patch endEditMessage:",
+                    error,
+                );
+            }
         }
     },
 
     onUnload() {
-        for (const unpatch of patches.splice(0)) {
+        for (const unpatch of patches) {
             try {
                 unpatch();
-            } catch {}
+            } catch {
+                // Ignore already removed patches.
+            }
         }
 
+        patches = [];
         edits.clear();
-        resetEditState();
-        loaded = false;
+        isEditing = false;
     },
 };
